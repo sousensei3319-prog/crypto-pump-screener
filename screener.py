@@ -11,8 +11,8 @@ OKX_TICKERS_URL = f"{OKX_BASE}/market/tickers?instType=SWAP"
 OKX_CANDLES_URL = f"{OKX_BASE}/market/candles"
 OKX_FUNDING_URL = f"{OKX_BASE}/public/funding-rate"
 
-PUMP_THRESHOLD_1H = 1.0
-PUMP_THRESHOLD_1H_URGENT = 3.0
+PUMP_THRESHOLD_1H = 10.0
+PUMP_THRESHOLD_1H_URGENT = 20.0
 MIN_VOLUME_24H = 2_000_000
 
 JST = timezone(timedelta(hours=9))
