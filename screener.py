@@ -6,15 +6,13 @@ from datetime import datetime, timezone, timedelta
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
-BINANCE_FUTURES_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
-BINANCE_FUTURES_PREMIUM_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
-BINANCE_FUTURES_OI_URL = "https://fapi.binance.com/fapi/v1/openInterest"
+BYBIT_BASE = "https://api.bybit.com/v5"
+BYBIT_TICKERS_URL = f"{BYBIT_BASE}/market/tickers?category=linear"
+BYBIT_KLINES_URL = f"{BYBIT_BASE}/market/kline"
 
 PUMP_THRESHOLD_1H = 10.0
 PUMP_THRESHOLD_1H_URGENT = 20.0
 MIN_VOLUME_24H = 2_000_000
-MIN_FUNDING_RATE = 0.0005
 
 JST = timezone(timedelta(hours=9))
 
@@ -26,31 +24,25 @@ def fetch_json(url):
 
 
 def get_all_tickers():
-    return fetch_json(BINANCE_FUTURES_TICKER_URL)
+    data = fetch_json(BYBIT_TICKERS_URL)
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit API error: {data.get('retMsg')}")
+    return data["result"]["list"]
 
 
 def get_1h_change(symbol):
-    url = f"{BINANCE_FUTURES_KLINES_URL}?symbol={symbol}&interval=1h&limit=2"
-    klines = fetch_json(url)
+    url = f"{BYBIT_KLINES_URL}?category=linear&symbol={symbol}&interval=60&limit=2"
+    data = fetch_json(url)
+    if data.get("retCode") != 0:
+        return 0.0
+    klines = data["result"]["list"]
     if len(klines) < 2:
         return 0.0
-    prev_open = float(klines[0][1])
-    current_close = float(klines[1][4])
+    prev_open = float(klines[1][1])
+    current_close = float(klines[0][4])
     if prev_open == 0:
         return 0.0
     return ((current_close - prev_open) / prev_open) * 100
-
-
-def get_funding_rate(symbol):
-    url = f"{BINANCE_FUTURES_PREMIUM_URL}?symbol={symbol}"
-    data = fetch_json(url)
-    return float(data.get("lastFundingRate", 0))
-
-
-def get_open_interest(symbol):
-    url = f"{BINANCE_FUTURES_OI_URL}?symbol={symbol}"
-    data = fetch_json(url)
-    return float(data.get("openInterest", 0))
 
 
 def send_discord(embeds):
@@ -71,10 +63,10 @@ def send_discord(embeds):
 def make_embed(symbol, chg_1h, price, vol_24h, funding, level):
     if level == "urgent":
         color = 0xFF0000
-        title = f"🔴 URGENT: {symbol}"
+        title = f"\U0001f534 URGENT: {symbol}"
     else:
         color = 0xFFFF00
-        title = f"🟡 WATCH: {symbol}"
+        title = f"\U0001f7e1 WATCH: {symbol}"
 
     fr_pct = funding * 100
     fr_annualized = fr_pct * 3 * 365
@@ -96,7 +88,8 @@ def make_embed(symbol, chg_1h, price, vol_24h, funding, level):
     if chg_1h >= PUMP_THRESHOLD_1H and fr_pct > 0.03:
         action_lines.append("Pump + elevated FR = potential short opportunity")
 
-    action_lines.append(f"[CoinGlass Detail](https://www.coinglass.com/ja/currencies/{symbol.replace('USDT', '')})")
+    coin = symbol.replace("USDT", "")
+    action_lines.append(f"[CoinGlass Detail](https://www.coinglass.com/ja/currencies/{coin})")
     action_lines.append(f"[Orion Terminal](https://screener.orionterminal.com/)")
 
     fields.append({"name": "Action", "value": "\n".join(action_lines), "inline": False})
@@ -114,20 +107,31 @@ def main():
 
     tickers = get_all_tickers()
     usdt_tickers = [t for t in tickers if t["symbol"].endswith("USDT")]
-    print(f"Scanning {len(usdt_tickers)} USDT pairs...")
+    print(f"Scanning {len(usdt_tickers)} USDT pairs (Bybit Linear Perpetuals)...")
 
     candidates = []
     for t in usdt_tickers:
-        vol_24h = float(t["quoteVolume"])
+        try:
+            vol_24h = float(t.get("turnover24h", 0))
+        except (TypeError, ValueError):
+            continue
+
         if vol_24h < MIN_VOLUME_24H:
             continue
 
-        price_change_24h = float(t["priceChangePercent"])
+        try:
+            price_change_24h = float(t.get("price24hPcnt", 0)) * 100
+        except (TypeError, ValueError):
+            continue
+
         if abs(price_change_24h) < 5:
             continue
 
         symbol = t["symbol"]
-        price = float(t["lastPrice"])
+        try:
+            price = float(t["lastPrice"])
+        except (TypeError, ValueError, KeyError):
+            continue
 
         try:
             chg_1h = get_1h_change(symbol)
@@ -139,8 +143,8 @@ def main():
             continue
 
         try:
-            funding = get_funding_rate(symbol)
-        except Exception:
+            funding = float(t.get("fundingRate", 0))
+        except (TypeError, ValueError):
             funding = 0.0
 
         candidates.append({
@@ -157,9 +161,7 @@ def main():
         print("No pumps detected. All quiet.")
         return
 
-    print(f"\n{'='*60}")
     print(f"FOUND {len(candidates)} pump(s)!")
-    print(f"{'='*60}")
 
     embeds = []
     for c in candidates[:10]:
@@ -176,7 +178,7 @@ def main():
     if embeds:
         send_discord(embeds)
 
-    print(f"\nSent {len(candidates)} alert(s) to Discord.")
+    print(f"Sent {len(candidates)} alert(s) to Discord.")
 
 
 if __name__ == "__main__":
