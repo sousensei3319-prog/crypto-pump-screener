@@ -6,9 +6,10 @@ from datetime import datetime, timezone, timedelta
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
-BYBIT_BASE = "https://api.bybit.com/v5"
-BYBIT_TICKERS_URL = f"{BYBIT_BASE}/market/tickers?category=linear"
-BYBIT_KLINES_URL = f"{BYBIT_BASE}/market/kline"
+OKX_BASE = "https://www.okx.com/api/v5"
+OKX_TICKERS_URL = f"{OKX_BASE}/market/tickers?instType=SWAP"
+OKX_CANDLES_URL = f"{OKX_BASE}/market/candles"
+OKX_FUNDING_URL = f"{OKX_BASE}/public/funding-rate"
 
 PUMP_THRESHOLD_1H = 10.0
 PUMP_THRESHOLD_1H_URGENT = 20.0
@@ -24,25 +25,36 @@ def fetch_json(url):
 
 
 def get_all_tickers():
-    data = fetch_json(BYBIT_TICKERS_URL)
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error: {data.get('retMsg')}")
-    return data["result"]["list"]
+    data = fetch_json(OKX_TICKERS_URL)
+    if data.get("code") != "0":
+        raise RuntimeError(f"OKX API error: {data.get('msg')}")
+    return [t for t in data["data"] if t["instId"].endswith("-USDT-SWAP")]
 
 
-def get_1h_change(symbol):
-    url = f"{BYBIT_KLINES_URL}?category=linear&symbol={symbol}&interval=60&limit=2"
+def get_1h_change(inst_id):
+    url = f"{OKX_CANDLES_URL}?instId={inst_id}&bar=1H&limit=2"
     data = fetch_json(url)
-    if data.get("retCode") != 0:
+    if data.get("code") != "0":
         return 0.0
-    klines = data["result"]["list"]
-    if len(klines) < 2:
+    candles = data.get("data", [])
+    if len(candles) < 2:
         return 0.0
-    prev_open = float(klines[1][1])
-    current_close = float(klines[0][4])
+    prev_open = float(candles[1][1])
+    current_close = float(candles[0][4])
     if prev_open == 0:
         return 0.0
     return ((current_close - prev_open) / prev_open) * 100
+
+
+def get_funding_rate(inst_id):
+    url = f"{OKX_FUNDING_URL}?instId={inst_id}"
+    data = fetch_json(url)
+    if data.get("code") != "0":
+        return 0.0
+    items = data.get("data", [])
+    if not items:
+        return 0.0
+    return float(items[0].get("fundingRate", 0))
 
 
 def send_discord(embeds):
@@ -60,7 +72,10 @@ def send_discord(embeds):
         print(f"Discord error: {e.code} {e.read().decode()}")
 
 
-def make_embed(symbol, chg_1h, price, vol_24h, funding, level):
+def make_embed(inst_id, chg_1h, price, vol_24h, funding, level):
+    symbol = inst_id.replace("-USDT-SWAP", "USDT")
+    coin = inst_id.replace("-USDT-SWAP", "")
+
     if level == "urgent":
         color = 0xFF0000
         title = f"\U0001f534 URGENT: {symbol}"
@@ -88,7 +103,6 @@ def make_embed(symbol, chg_1h, price, vol_24h, funding, level):
     if chg_1h >= PUMP_THRESHOLD_1H and fr_pct > 0.03:
         action_lines.append("Pump + elevated FR = potential short opportunity")
 
-    coin = symbol.replace("USDT", "")
     action_lines.append(f"[CoinGlass Detail](https://www.coinglass.com/ja/currencies/{coin})")
     action_lines.append(f"[Orion Terminal](https://screener.orionterminal.com/)")
 
@@ -98,7 +112,7 @@ def make_embed(symbol, chg_1h, price, vol_24h, funding, level):
         "title": title,
         "color": color,
         "fields": fields,
-        "footer": {"text": f"Pump Screener | {now_jst}"},
+        "footer": {"text": f"Pump Screener (OKX) | {now_jst}"},
     }
 
 
@@ -106,13 +120,12 @@ def main():
     print(f"Starting scan at {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}")
 
     tickers = get_all_tickers()
-    usdt_tickers = [t for t in tickers if t["symbol"].endswith("USDT")]
-    print(f"Scanning {len(usdt_tickers)} USDT pairs (Bybit Linear Perpetuals)...")
+    print(f"Scanning {len(tickers)} USDT-SWAP pairs (OKX Perpetuals)...")
 
     candidates = []
-    for t in usdt_tickers:
+    for t in tickers:
         try:
-            vol_24h = float(t.get("turnover24h", 0))
+            vol_24h = float(t.get("volCcy24h", 0)) * float(t.get("last", 0))
         except (TypeError, ValueError):
             continue
 
@@ -120,36 +133,36 @@ def main():
             continue
 
         try:
-            price_change_24h = float(t.get("price24hPcnt", 0)) * 100
-        except (TypeError, ValueError):
-            continue
-
-        if abs(price_change_24h) < 5:
-            continue
-
-        symbol = t["symbol"]
-        try:
-            price = float(t["lastPrice"])
+            last = float(t["last"])
+            open_24h = float(t.get("open24h", last))
+            if open_24h == 0:
+                continue
+            chg_24h = ((last - open_24h) / open_24h) * 100
         except (TypeError, ValueError, KeyError):
             continue
 
+        if abs(chg_24h) < 5:
+            continue
+
+        inst_id = t["instId"]
+
         try:
-            chg_1h = get_1h_change(symbol)
+            chg_1h = get_1h_change(inst_id)
         except Exception as e:
-            print(f"  Skipping {symbol} (kline error: {e})")
+            print(f"  Skipping {inst_id} (candle error: {e})")
             continue
 
         if abs(chg_1h) < PUMP_THRESHOLD_1H:
             continue
 
         try:
-            funding = float(t.get("fundingRate", 0))
-        except (TypeError, ValueError):
+            funding = get_funding_rate(inst_id)
+        except Exception:
             funding = 0.0
 
         candidates.append({
-            "symbol": symbol,
-            "price": price,
+            "inst_id": inst_id,
+            "price": last,
             "chg_1h": chg_1h,
             "vol_24h": vol_24h,
             "funding": funding,
@@ -166,9 +179,9 @@ def main():
     embeds = []
     for c in candidates[:10]:
         level = "urgent" if abs(c["chg_1h"]) >= PUMP_THRESHOLD_1H_URGENT else "watch"
-        print(f"  {c['symbol']}: {c['chg_1h']:+.2f}% (1h), FR: {c['funding']*100:.4f}%, Vol: ${c['vol_24h']:,.0f}")
+        print(f"  {c['inst_id']}: {c['chg_1h']:+.2f}% (1h), FR: {c['funding']*100:.4f}%, Vol: ${c['vol_24h']:,.0f}")
 
-        embed = make_embed(c["symbol"], c["chg_1h"], c["price"], c["vol_24h"], c["funding"], level)
+        embed = make_embed(c["inst_id"], c["chg_1h"], c["price"], c["vol_24h"], c["funding"], level)
         embeds.append(embed)
 
         if len(embeds) == 10:
