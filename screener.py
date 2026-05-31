@@ -1,82 +1,96 @@
 """
-Crypto Pump-Dump Screener (OKX) - with historical reproducibility analysis.
+Crypto Pump-Dump Screener v3 (OKX) - Orion-equivalent metrics + chart attachments.
 
-Strategy (per user's discretionary playbook):
-  - Find small/mid-cap perps that pumped (1h>=10% OR 24h>=20%)
-  - For each candidate, analyze its OWN history: how many times did it pump
-    a similar amount and then dump? (reproducibility = the core edge)
-  - Measure typical retrace depth (full vs half) -> concrete TP prices
-  - Do NOT scream "short now". Report 4h trend state + downtrend trigger,
-    so the user enters AFTER a downtrend confirms (no falling-knife).
-  - Add confluence: funding, OI surge, retail long/short ratio, category.
+What it does on every run:
+  1. Pull all USDT perps from OKX (geo-OK from GitHub Actions).
+  2. Pre-filter by 24h move + volume (Big Movers + High Volume).
+  3. For each candidate, deeply analyze:
+     - Historical reproducibility (past pumps -> dump rate, retrace depth)
+     - Confluence: Funding, OI 1h change, retail L/S, CVD 1h, volatility, BTC correlation, category
+     - 4h trend state + concrete entry/SL/TP plan (no falling-knife)
+  4. Score 0..10, sort, and POST to Discord with @everyone mention + PNG chart.
 """
 
-import os
+import io
 import json
-import urllib.request
+import math
+import os
 import urllib.error
-from datetime import datetime, timezone, timedelta
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
+
+# matplotlib is optional - if missing we just skip chart attachment
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+MENTION_EVERYONE = os.environ.get("MENTION_EVERYONE", "1") == "1"
 
 OKX = "https://www.okx.com/api/v5"
 
-# ---- Detection thresholds ----
-PUMP_1H = 10.0          # 1h % move to flag a fast spike
-PUMP_24H = 20.0         # 24h % move to flag a daily pump
+# ---- Detection thresholds (PRODUCTION) ----
+PUMP_1H = 10.0
+PUMP_24H = 20.0
 MIN_VOLUME_24H = 2_000_000
-EXCLUDE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP"}  # focus on alts/memes, not majors
+EXCLUDE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
 
 # ---- Historical analysis params ----
-HIST_DAYS = 300                 # daily candles to analyze
-PUMP_EVENT_PCT = 15.0           # a past "pump day" = daily high >= +15% over prev close
-FORWARD_WINDOW = 3              # days to look forward for the dump
-DUMP_RETRACE_MIN = 0.5          # retrace >= 50% of the pump counts as "dumped"
+HIST_DAYS = 300
+PUMP_EVENT_PCT = 15.0
+FORWARD_WINDOW = 3
+DUMP_RETRACE_MIN = 0.5
 
-# ---- Category heuristic (激熱: meme / gamefi / AI). Editable. ----
+# ---- Category lists ----
 MEME = {"DOGE","SHIB","PEPE","WIF","BONK","FLOKI","MEME","BOME","MEW","POPCAT","NEIRO",
         "TURBO","BRETT","MOG","PNUT","GOAT","ACT","HIPPO","DOGS","CAT","BABYDOGE","SPX",
         "GIGGLE","FARTCOIN","CHILLGUY","MOODENG","PONKE","RETARDIO","SLERF","MYRO"}
 GAMEFI = {"GALA","AXS","SAND","MANA","IMX","PIXEL","BIGTIME","GMT","MAGIC","PYR","ILV",
           "APE","GODS","NAKA","XAI","ACE","PORTAL","ZBCN"}
 AI = {"FET","AGIX","RNDR","RENDER","TAO","WLD","AI","ARKM","NMR","OCEAN","GRT","PHA",
-      "AIOZ","NFP","TURBO","VIRTUAL","AIXBT","ZEREBRO","GRIFFAIN","AI16Z","ARC","SWARMS"}
+      "AIOZ","NFP","VIRTUAL","AIXBT","ZEREBRO","GRIFFAIN","AI16Z","ARC","SWARMS"}
 
 JST = timezone(timedelta(hours=9))
 
 
-# ----------------------------------------------------------------------
+# ============================================================
 # HTTP
-# ----------------------------------------------------------------------
+# ============================================================
 def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "pump-screener/2.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
+    req = urllib.request.Request(url, headers={"User-Agent": "pump-screener/3.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
 
 
 def okx_get(path):
-    data = fetch_json(f"{OKX}{path}")
-    if data.get("code") != "0":
-        raise RuntimeError(f"OKX error {data.get('code')}: {data.get('msg')}")
-    return data["data"]
+    d = fetch_json(f"{OKX}{path}")
+    if d.get("code") != "0":
+        raise RuntimeError(f"OKX {d.get('code')}: {d.get('msg')}")
+    return d["data"]
 
 
-# ----------------------------------------------------------------------
+# ============================================================
 # Data fetchers
-# ----------------------------------------------------------------------
+# ============================================================
 def get_all_tickers():
-    data = okx_get("/market/tickers?instType=SWAP")
-    return [t for t in data if t["instId"].endswith("-USDT-SWAP")]
+    d = okx_get("/market/tickers?instType=SWAP")
+    return [t for t in d if t["instId"].endswith("-USDT-SWAP")]
 
 
 def get_candles(inst_id, bar, limit):
-    # newest first -> we reverse to oldest first
-    data = okx_get(f"/market/candles?instId={inst_id}&bar={bar}&limit={limit}")
+    d = okx_get(f"/market/candles?instId={inst_id}&bar={bar}&limit={limit}")
     rows = []
-    for c in data:
+    for c in d:
         rows.append({
             "ts": int(c[0]),
             "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4]),
+            "v": float(c[5]) if len(c) > 5 else 0.0,
         })
     rows.reverse()
     return rows
@@ -89,8 +103,7 @@ def get_funding(inst_id):
             return 0.0, None
         fr = float(d[0].get("fundingRate", 0))
         nft = d[0].get("nextFundingTime")
-        nft = int(nft) if nft else None
-        return fr, nft
+        return fr, (int(nft) if nft else None)
     except Exception:
         return 0.0, None
 
@@ -98,7 +111,6 @@ def get_funding(inst_id):
 def get_oi_change_1h(ccy):
     try:
         d = okx_get(f"/rubik/stat/contracts/open-interest-volume?ccy={ccy}&period=1H")
-        # newest first: [ts, oi, vol]
         if len(d) < 2:
             return None
         oi_now = float(d[0][1])
@@ -113,26 +125,33 @@ def get_oi_change_1h(ccy):
 def get_ls_ratio(ccy):
     try:
         d = okx_get(f"/rubik/stat/contracts/long-short-account-ratio?ccy={ccy}&period=5m")
-        if not d:
-            return None
-        return float(d[0][1])  # newest first: [ts, ratio]
+        return float(d[0][1]) if d else None
     except Exception:
         return None
 
 
-# ----------------------------------------------------------------------
-# Historical reproducibility analysis  (the core edge)
-# ----------------------------------------------------------------------
+def get_cvd_1h(ccy):
+    """OKX taker buy/sell volume -> 1h CVD (USD-denominated taker delta)."""
+    try:
+        d = okx_get(f"/rubik/stat/taker-volume?ccy={ccy}&instType=SWAP&period=5m")
+        # newest first: [ts, sellVol, buyVol]
+        if not d:
+            return None
+        bars = d[:12]  # last 12 * 5m = 1h
+        delta = sum(float(b[2]) - float(b[1]) for b in bars)
+        return delta
+    except Exception:
+        return None
+
+
+# ============================================================
+# Reproducibility (the core edge)
+# ============================================================
 def analyze_history(daily):
-    """
-    Scan daily candles for past pump events and measure the subsequent dump.
-    Returns a dict of stats, or None if not enough history.
-    """
     n = len(daily)
     if n < 30:
         return None
-
-    events = []  # each: {pump_pct, retrace_frac, days_to_trough}
+    events = []
     for i in range(1, n - 1):
         prev_close = daily[i - 1]["c"]
         if prev_close <= 0:
@@ -141,27 +160,18 @@ def analyze_history(daily):
         pump_pct = (peak - prev_close) / prev_close * 100
         if pump_pct < PUMP_EVENT_PCT:
             continue
-
         baseline = prev_close
-        # look forward for the trough
         fwd = daily[i + 1: i + 1 + FORWARD_WINDOW]
         if not fwd:
             continue
         trough = min(b["l"] for b in fwd)
-        # day offset of the trough
-        days_to_trough = 1 + min(
-            range(len(fwd)), key=lambda k: fwd[k]["l"]
-        )
+        days_to_trough = 1 + min(range(len(fwd)), key=lambda k: fwd[k]["l"])
         denom = peak - baseline
         if denom <= 0:
             continue
-        retrace_frac = (peak - trough) / denom  # 1.0 = full retrace to baseline
-        retrace_frac = max(0.0, retrace_frac)
-        events.append({
-            "pump_pct": pump_pct,
-            "retrace_frac": retrace_frac,
-            "days_to_trough": days_to_trough,
-        })
+        retrace_frac = max(0.0, (peak - trough) / denom)
+        events.append({"pump_pct": pump_pct, "retrace_frac": retrace_frac,
+                       "days_to_trough": days_to_trough})
 
     if not events:
         return None
@@ -171,11 +181,10 @@ def analyze_history(daily):
     dump_rate = len(dumped) / N
     avg_retrace = sum(e["retrace_frac"] for e in dumped) / len(dumped) if dumped else 0.0
     avg_days = sum(e["days_to_trough"] for e in dumped) / len(dumped) if dumped else 0.0
-    pump_sizes = sorted(e["pump_pct"] for e in events)
-    typ_lo = pump_sizes[len(pump_sizes) // 4]
-    typ_hi = pump_sizes[(len(pump_sizes) * 3) // 4]
+    sizes = sorted(e["pump_pct"] for e in events)
+    typ_lo = sizes[len(sizes) // 4]
+    typ_hi = sizes[(len(sizes) * 3) // 4]
 
-    # reproducibility tier
     if N >= 15 and dump_rate >= 0.80:
         tier, tier_score = "VERY HIGH", 4
     elif N >= 8 and dump_rate >= 0.70:
@@ -185,7 +194,6 @@ def analyze_history(daily):
     else:
         tier, tier_score = "LOW", 0
 
-    # TP tendency
     if avg_retrace >= 0.85:
         tp_tendency = "near-FULL retrace"
     elif avg_retrace >= 0.5:
@@ -193,18 +201,16 @@ def analyze_history(daily):
     else:
         tp_tendency = "shallow"
 
-    return {
-        "N": N, "dump_count": len(dumped), "dump_rate": dump_rate,
-        "avg_retrace": avg_retrace, "avg_days": avg_days,
-        "typ_lo": typ_lo, "typ_hi": typ_hi,
-        "tier": tier, "tier_score": tier_score, "tp_tendency": tp_tendency,
-        "hist_days": n,
-    }
+    return {"N": N, "dump_count": len(dumped), "dump_rate": dump_rate,
+            "avg_retrace": avg_retrace, "avg_days": avg_days,
+            "typ_lo": typ_lo, "typ_hi": typ_hi,
+            "tier": tier, "tier_score": tier_score, "tp_tendency": tp_tendency,
+            "hist_days": n}
 
 
-# ----------------------------------------------------------------------
-# 4h trend state + downtrend trigger
-# ----------------------------------------------------------------------
+# ============================================================
+# 4h trend + downtrend trigger
+# ============================================================
 def ema(values, period):
     if not values:
         return None
@@ -221,144 +227,260 @@ def trend_state_4h(c4h):
     closes = [b["c"] for b in c4h]
     e20 = ema(closes, 20)
     price = closes[-1]
-    # recent swing low (last 6 bars, excluding current) = downtrend trigger
     recent = c4h[-7:-1]
     swing_low = min(b["l"] for b in recent) if recent else c4h[-1]["l"]
-    # lower-high check: is recent high below the prior high?
     above_ema = price > e20
     if above_ema:
-        state = "still ABOVE 4h EMA20 (pumping) -> WAIT for breakdown"
+        state = "ABOVE 4h EMA20 (still pumping) -> WAIT for breakdown"
     elif price < swing_low:
-        state = "BELOW 4h EMA20 & broke swing low -> DOWNTREND (entry zone)"
+        state = "BELOW 4h EMA20 + swing low broken -> DOWNTREND (entry zone)"
     else:
         state = "BELOW 4h EMA20 (rolling over) -> watch swing low"
     return {"ema20": e20, "swing_low": swing_low, "above_ema": above_ema, "state": state}
 
 
-# ----------------------------------------------------------------------
+def volatility_pct(c1h_24):
+    """Average True Range as % over last 24 hourly bars."""
+    if len(c1h_24) < 2:
+        return None
+    trs = []
+    for i in range(1, len(c1h_24)):
+        h = c1h_24[i]["h"]; l = c1h_24[i]["l"]; pc = c1h_24[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return None
+    atr = sum(trs) / len(trs)
+    return atr / c1h_24[-1]["c"] * 100
+
+
+def correlation_with_btc(asset_closes, btc_closes):
+    n = min(len(asset_closes), len(btc_closes))
+    if n < 10:
+        return None
+    a = asset_closes[-n:]; b = btc_closes[-n:]
+    # log returns
+    def rets(s):
+        return [math.log(s[i] / s[i - 1]) for i in range(1, len(s)) if s[i - 1] > 0 and s[i] > 0]
+    ra = rets(a); rb = rets(b)
+    n = min(len(ra), len(rb))
+    if n < 5:
+        return None
+    ra = ra[-n:]; rb = rb[-n:]
+    ma = sum(ra) / n; mb = sum(rb) / n
+    cov = sum((ra[i] - ma) * (rb[i] - mb) for i in range(n)) / n
+    va = sum((x - ma) ** 2 for x in ra) / n
+    vb = sum((x - mb) ** 2 for x in rb) / n
+    if va <= 0 or vb <= 0:
+        return None
+    return cov / math.sqrt(va * vb)
+
+
+# ============================================================
 # Helpers
-# ----------------------------------------------------------------------
+# ============================================================
 def fmt_price(p):
-    if p >= 100:
-        return f"${p:,.2f}"
-    if p >= 1:
-        return f"${p:,.3f}"
-    if p >= 0.01:
-        return f"${p:.4f}"
+    if p >= 100: return f"${p:,.2f}"
+    if p >= 1:   return f"${p:,.3f}"
+    if p >= 0.01: return f"${p:.4f}"
     return f"${p:.6f}"
 
 
 def category_of(coin):
     cats = []
-    if coin in MEME:
-        cats.append("MEME")
-    if coin in GAMEFI:
-        cats.append("GameFi")
-    if coin in AI:
-        cats.append("AI")
+    if coin in MEME:   cats.append("MEME")
+    if coin in GAMEFI: cats.append("GameFi")
+    if coin in AI:     cats.append("AI")
     return cats
 
 
 def minutes_until(ms_ts):
-    if not ms_ts:
-        return None
+    if not ms_ts: return None
     now = datetime.now(timezone.utc).timestamp() * 1000
     return int((ms_ts - now) / 60000)
 
 
-# ----------------------------------------------------------------------
-# Scoring
-# ----------------------------------------------------------------------
-def score_candidate(hist, funding, oi_chg, ls_ratio, cats):
+def fmt_money(x):
+    if x is None: return "n/a"
+    a = abs(x)
+    if a >= 1e9: return f"${x/1e9:.2f}B"
+    if a >= 1e6: return f"${x/1e6:.2f}M"
+    if a >= 1e3: return f"${x/1e3:.2f}K"
+    return f"${x:.0f}"
+
+
+# ============================================================
+# Scoring  (Orion's quick-filter buttons rolled into one score)
+# ============================================================
+def score_candidate(hist, funding, oi_chg, ls_ratio, cvd, vlt, cats):
     score = 0
     reasons = []
-
     if hist:
         score += hist["tier_score"]
         if hist["tier_score"] > 0:
-            reasons.append(f"reproducibility {hist['tier']} (+{hist['tier_score']})")
+            reasons.append(f"repro {hist['tier']}(+{hist['tier_score']})")
 
     fr_pct = funding * 100
     if fr_pct > 0.1:
-        score += 2; reasons.append("FR very high (+2)")
+        score += 2; reasons.append("FR very high(+2)")
     elif fr_pct > 0.05:
-        score += 1; reasons.append("FR elevated (+1)")
+        score += 1; reasons.append("FR elevated(+1)")
 
     if oi_chg is not None:
         if oi_chg > 10:
-            score += 2; reasons.append("OI surge (+2)")
+            score += 2; reasons.append("OI surge(+2)")
         elif oi_chg > 5:
-            score += 1; reasons.append("OI rising (+1)")
+            score += 1; reasons.append("OI rising(+1)")
 
     if ls_ratio is not None:
         if ls_ratio > 2.0:
-            score += 2; reasons.append("retail very long (+2)")
+            score += 2; reasons.append("retail very long(+2)")
         elif ls_ratio > 1.5:
-            score += 1; reasons.append("retail long-heavy (+1)")
+            score += 1; reasons.append("retail long-heavy(+1)")
+
+    if cvd is not None and cvd < 0:
+        score += 1; reasons.append("CVD selling(+1)")
+
+    if vlt is not None and vlt > 3.0:
+        score += 1; reasons.append("high vol(+1)")
 
     if cats:
-        score += 1; reasons.append(f"{'/'.join(cats)} (+1)")
+        score += 1; reasons.append(f"{'/'.join(cats)}(+1)")
 
     return min(score, 10), reasons
 
 
-# ----------------------------------------------------------------------
-# Discord
-# ----------------------------------------------------------------------
-def send_discord(embeds):
-    payload = json.dumps({"embeds": embeds}).encode()
-    req = urllib.request.Request(
-        DISCORD_WEBHOOK_URL, data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "pump-screener/2.0"},
-        method="POST",
-    )
+# ============================================================
+# Chart rendering (matplotlib)
+# ============================================================
+def render_chart_png(coin, c1h, c4h, plan_levels):
+    if not HAS_MPL or not c1h:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=10):
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6), dpi=110,
+                                 gridspec_kw={"height_ratios": [3, 1]})
+        ax, axv = axes
+        bars = c1h[-72:]  # last 72h
+        xs = list(range(len(bars)))
+        widths = 0.7
+        for i, b in enumerate(bars):
+            up = b["c"] >= b["o"]
+            color = "#26a69a" if up else "#ef5350"
+            # wick
+            ax.plot([i, i], [b["l"], b["h"]], color=color, linewidth=0.7)
+            # body
+            top = max(b["o"], b["c"]); bot = min(b["o"], b["c"])
+            height = max(top - bot, (bars[-1]["c"] * 0.0005))
+            ax.add_patch(Rectangle((i - widths / 2, bot), widths, height,
+                                   facecolor=color, edgecolor=color))
+            axv.bar(i, b["v"], width=widths, color=color, alpha=0.7)
+
+        # Plan lines
+        sl, tp1, tp2, trig = plan_levels.get("sl"), plan_levels.get("tp1"), \
+                              plan_levels.get("tp2"), plan_levels.get("trigger")
+        if sl:   ax.axhline(sl,   color="#ff5252", linestyle="--", linewidth=0.9, label=f"SL {sl:.6g}")
+        if trig: ax.axhline(trig, color="#ffb74d", linestyle="--", linewidth=0.9, label=f"Trig {trig:.6g}")
+        if tp1:  ax.axhline(tp1,  color="#66bb6a", linestyle="--", linewidth=0.9, label=f"TP1 {tp1:.6g}")
+        if tp2:  ax.axhline(tp2,  color="#1e88e5", linestyle="--", linewidth=0.9, label=f"TP2 {tp2:.6g}")
+
+        ax.set_title(f"{coin} - 1h (last 72h)  |  OKX", color="#eeeeee", fontsize=11)
+        ax.legend(fontsize=7, loc="upper left")
+        ax.grid(True, alpha=0.2)
+        axv.grid(True, alpha=0.2)
+        for a in (ax, axv):
+            a.set_facecolor("#1e222d")
+            a.tick_params(colors="#aaaaaa", labelsize=7)
+            for spine in a.spines.values():
+                spine.set_color("#444444")
+        fig.patch.set_facecolor("#131722")
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"  chart render failed: {e}")
+        return None
+
+
+# ============================================================
+# Discord
+# ============================================================
+def discord_post(payload_json, attachments=None):
+    """attachments = list of (filename, bytes). If None -> JSON post."""
+    boundary = f"----pump{uuid.uuid4().hex}"
+    if not attachments:
+        data = json.dumps(payload_json).encode()
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL, data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "pump-screener/3.0"},
+        )
+    else:
+        body = bytearray()
+        # payload_json part
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="payload_json"\r\n'
+        body += b"Content-Type: application/json\r\n\r\n"
+        body += json.dumps(payload_json).encode()
+        body += b"\r\n"
+        for idx, (fname, content) in enumerate(attachments):
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="files[{idx}]"; filename="{fname}"\r\n'.encode()
+            body += b"Content-Type: image/png\r\n\r\n"
+            body += content
+            body += b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL, data=bytes(body), method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                     "User-Agent": "pump-screener/3.0"},
+        )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
             pass
     except urllib.error.HTTPError as e:
-        print(f"Discord error: {e.code} {e.read().decode()}")
+        print(f"Discord error: {e.code} {e.read().decode()[:200]}")
 
 
 def build_embed(cand):
-    coin = cand["coin"]
-    inst = cand["inst_id"]
-    price = cand["price"]
-    score = cand["score"]
-    hist = cand["hist"]
-    tr = cand["trend"]
+    coin = cand["coin"]; inst = cand["inst_id"]
+    price = cand["price"]; score = cand["score"]
+    hist = cand["hist"]; tr = cand["trend"]
 
-    if score >= 7:
-        color, tier_icon = 0xFF0000, "STRONG"
-    elif score >= 4:
-        color, tier_icon = 0xFFAA00, "WATCH"
-    else:
-        color, tier_icon = 0x888888, "WEAK"
+    if score >= 7:   color, tier_icon = 0xFF0000, "STRONG"
+    elif score >= 4: color, tier_icon = 0xFFAA00, "WATCH"
+    else:            color, tier_icon = 0x888888, "WEAK"
 
     repro = hist["tier"] if hist else "N/A"
     title = f"{tier_icon}: {coin}USDT  [Score {score}/10 | Repro {repro}]"
 
     now_jst = datetime.now(JST).strftime("%m-%d %H:%M JST")
-    cats = cand["cats"]
-    cat_str = "/".join(cats) if cats else "-"
+    cat_str = "/".join(cand["cats"]) if cand["cats"] else "-"
 
-    # --- confluence line ---
     fr_pct = cand["funding"] * 100
     nft_min = minutes_until(cand["next_funding"])
     fr_str = f"{fr_pct:+.4f}%"
     if nft_min is not None:
-        fr_str += f" (next in {nft_min}m)"
+        fr_str += f" (next {nft_min}m)"
     oi_str = f"{cand['oi_chg']:+.1f}%/1h" if cand["oi_chg"] is not None else "n/a"
     ls_str = f"{cand['ls_ratio']:.2f}" if cand["ls_ratio"] is not None else "n/a"
+    cvd_str = fmt_money(cand["cvd"]) if cand["cvd"] is not None else "n/a"
+    vlt_str = f"{cand['vlt']:.2f}%" if cand["vlt"] is not None else "n/a"
+    cor_str = f"{cand['btc_cor']:+.2f}" if cand["btc_cor"] is not None else "n/a"
 
     fields = [
-        {"name": "Move", "value": f"{fmt_price(price)} | 1h {cand['chg_1h']:+.1f}% | 24h {cand['chg_24h']:+.1f}%",
+        {"name": "Move",
+         "value": f"{fmt_price(price)} | 1h {cand['chg_1h']:+.1f}% | 24h {cand['chg_24h']:+.1f}%",
          "inline": False},
         {"name": "Confluence",
-         "value": f"FR {fr_str}\nOI {oi_str} | L/S {ls_str} | Vol ${cand['vol_24h']/1e6:.1f}M | Cat {cat_str}",
+         "value": (f"FR {fr_str}\n"
+                   f"OI {oi_str} | L/S {ls_str} | CVD1h {cvd_str}\n"
+                   f"Vol24h {fmt_money(cand['vol_24h'])} | VLT {vlt_str} | BTC-cor {cor_str} | Cat {cat_str}"),
          "inline": False},
     ]
 
-    # --- historical pattern ---
     if hist:
         hist_val = (
             f"{hist['N']} past pumps >={int(PUMP_EVENT_PCT)}% -> {hist['dump_count']} dumped "
@@ -373,23 +495,21 @@ def build_embed(cand):
     fields.append({"name": f"Historical Pattern ({hist['hist_days'] if hist else 0}d)",
                    "value": hist_val, "inline": False})
 
-    # --- trend / entry plan ---
-    baseline = cand["baseline"]
-    peak = cand["day_high"]
+    baseline = cand["baseline"]; peak = cand["day_high"]
     half_tp = peak - 0.5 * (peak - baseline)
     full_tp = baseline
     sl = peak * 1.02
+    trigger = tr["swing_low"] if tr else None
 
-    if tr:
-        if tr["above_ema"]:
-            plan = (f"4h: {tr['state']}\n"
-                    f"Entry trigger: 4h close below {fmt_price(tr['swing_low'])}\n"
-                    f"SL > {fmt_price(sl)} (day high) | "
-                    f"TP1 {fmt_price(half_tp)} (half) · TP2 {fmt_price(full_tp)} (full)")
-        else:
-            plan = (f"4h: {tr['state']}\n"
-                    f"Short on bounce. SL > {fmt_price(sl)} | "
-                    f"TP1 {fmt_price(half_tp)} (half) · TP2 {fmt_price(full_tp)} (full)")
+    if tr and tr["above_ema"]:
+        plan = (f"4h: {tr['state']}\n"
+                f"Entry trigger: 4h close below {fmt_price(tr['swing_low'])}\n"
+                f"SL > {fmt_price(sl)} (day high) | TP1 {fmt_price(half_tp)} (half) · "
+                f"TP2 {fmt_price(full_tp)} (full)")
+    elif tr:
+        plan = (f"4h: {tr['state']}\n"
+                f"Short on bounce. SL > {fmt_price(sl)} | "
+                f"TP1 {fmt_price(half_tp)} (half) · TP2 {fmt_price(full_tp)} (full)")
     else:
         plan = (f"SL > {fmt_price(sl)} | TP1 {fmt_price(half_tp)} (half) · "
                 f"TP2 {fmt_price(full_tp)} (full)")
@@ -403,17 +523,27 @@ def build_embed(cand):
         "inline": False,
     })
 
-    return {"title": title, "color": color, "fields": fields,
-            "footer": {"text": f"Pump-Dump Screener | {now_jst}"}}
+    embed = {"title": title, "color": color, "fields": fields,
+             "footer": {"text": f"Pump-Dump Screener v3 | {now_jst}"}}
+
+    plan_levels = {"sl": sl, "tp1": half_tp, "tp2": full_tp, "trigger": trigger}
+    return embed, plan_levels
 
 
-# ----------------------------------------------------------------------
+# ============================================================
 # Main
-# ----------------------------------------------------------------------
+# ============================================================
 def main():
-    print(f"Scan start {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}")
+    print(f"Scan v3 start {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}")
     tickers = get_all_tickers()
-    print(f"Fetched {len(tickers)} USDT-SWAP tickers")
+    print(f"Fetched {len(tickers)} USDT-SWAP tickers (matplotlib={HAS_MPL})")
+
+    # BTC daily closes for correlation
+    btc_d = []
+    try:
+        btc_d = [b["c"] for b in get_candles("BTC-USDT-SWAP", "1D", 60)]
+    except Exception as e:
+        print(f"  BTC reference fetch failed: {e}")
 
     # ---- Stage 1: cheap pump screen ----
     prelim = []
@@ -430,85 +560,98 @@ def main():
         if vol < MIN_VOLUME_24H or open24 <= 0:
             continue
         chg_24h = (last - open24) / open24 * 100
-        if chg_24h < PUMP_24H:
-            # may still qualify on 1h; check 1h cheaply only if 24h close-ish
-            if chg_24h < 5:
-                continue
+        if chg_24h < PUMP_24H and chg_24h < 5:
+            continue
         prelim.append({"inst_id": t["instId"], "coin": coin, "price": last,
                        "open24": open24, "vol_24h": vol, "chg_24h": chg_24h})
+    print(f"Stage-1 prelim: {len(prelim)}")
 
-    print(f"Stage-1 prelim candidates: {len(prelim)}")
-
-    # ---- Stage 2: deep analysis per candidate ----
+    # ---- Stage 2: deep analysis ----
     candidates = []
     for p in prelim:
-        inst = p["inst_id"]
-        coin = p["coin"]
+        inst = p["inst_id"]; coin = p["coin"]
         try:
-            c1h = get_candles(inst, "1H", 2)
+            c1h = get_candles(inst, "1H", 72)
             chg_1h = 0.0
-            if len(c1h) >= 2 and c1h[0]["o"] > 0:
-                chg_1h = (c1h[-1]["c"] - c1h[0]["o"]) / c1h[0]["o"] * 100
+            if len(c1h) >= 2 and c1h[-2]["o"] > 0:
+                chg_1h = (c1h[-1]["c"] - c1h[-2]["o"]) / c1h[-2]["o"] * 100
         except Exception:
-            chg_1h = 0.0
+            c1h = []; chg_1h = 0.0
 
-        # qualify: 1h>=PUMP_1H OR 24h>=PUMP_24H
         if not (abs(chg_1h) >= PUMP_1H or p["chg_24h"] >= PUMP_24H):
             continue
 
         try:
             daily = get_candles(inst, "1D", HIST_DAYS)
-        except Exception as e:
-            print(f"  {coin}: candle fetch failed ({e})")
+        except Exception:
             daily = []
-
-        hist = analyze_history(daily) if daily else None
-
         try:
             c4h = get_candles(inst, "4H", 50)
-            trend = trend_state_4h(c4h)
         except Exception:
-            trend = None
+            c4h = []
 
+        hist = analyze_history(daily) if daily else None
+        trend = trend_state_4h(c4h) if c4h else None
         funding, nft = get_funding(inst)
         oi_chg = get_oi_change_1h(coin)
         ls = get_ls_ratio(coin)
+        cvd = get_cvd_1h(coin)
+        vlt = volatility_pct(c1h[-25:]) if len(c1h) >= 25 else None
+        btc_cor = None
+        if btc_d and daily:
+            asset_closes = [b["c"] for b in daily[-30:]]
+            btc_closes = btc_d[-30:]
+            btc_cor = correlation_with_btc(asset_closes, btc_closes)
         cats = category_of(coin)
 
-        score, reasons = score_candidate(hist, funding, oi_chg, ls, cats)
+        score, reasons = score_candidate(hist, funding, oi_chg, ls, cvd, vlt, cats)
 
         baseline = p["open24"]
-        day_high = daily[-1]["h"] if daily else p["price"]
+        day_high = daily[-1]["h"] if daily else max(p["price"], p["open24"])
         pump_ref = (day_high - baseline) / baseline * 100 if baseline else p["chg_24h"]
 
         candidates.append({
             "inst_id": inst, "coin": coin, "price": p["price"],
             "chg_1h": chg_1h, "chg_24h": p["chg_24h"], "vol_24h": p["vol_24h"],
             "funding": funding, "next_funding": nft, "oi_chg": oi_chg,
-            "ls_ratio": ls, "cats": cats, "hist": hist, "trend": trend,
+            "ls_ratio": ls, "cvd": cvd, "vlt": vlt, "btc_cor": btc_cor,
+            "cats": cats, "hist": hist, "trend": trend,
             "score": score, "reasons": reasons,
             "baseline": baseline, "day_high": day_high, "pump_ref": pump_ref,
+            "_c1h": c1h, "_c4h": c4h,
         })
-        print(f"  {coin}: score {score}/10 | repro {hist['tier'] if hist else 'N/A'} "
+        print(f"  {coin}: score {score}/10 repro {hist['tier'] if hist else 'N/A'} "
               f"| 1h {chg_1h:+.1f}% 24h {p['chg_24h']:+.1f}% | {', '.join(reasons)}")
 
     if not candidates:
-        print("No qualifying pump candidates. All quiet.")
+        print("No qualifying candidates. All quiet.")
         return
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    embeds = []
-    for c in candidates[:10]:
-        embeds.append(build_embed(c))
-        if len(embeds) == 10:
-            send_discord(embeds)
-            embeds = []
-    if embeds:
-        send_discord(embeds)
+    # ---- Discord: one message per candidate so we can attach a chart per signal ----
+    mention = "@everyone" if MENTION_EVERYONE else ""
+    allowed = {"parse": ["everyone"]} if MENTION_EVERYONE else {"parse": []}
 
-    print(f"Sent {len(candidates)} signal(s) to Discord.")
+    sent = 0
+    for c in candidates[:10]:
+        embed, plan_levels = build_embed(c)
+        png = render_chart_png(c["coin"], c["_c1h"], c["_c4h"], plan_levels)
+        if png:
+            fname = f"{c['coin']}_chart.png"
+            embed["image"] = {"url": f"attachment://{fname}"}
+            payload = {"content": mention if sent == 0 else "",
+                       "embeds": [embed], "allowed_mentions": allowed}
+            discord_post(payload, attachments=[(fname, png)])
+        else:
+            payload = {"content": mention if sent == 0 else "",
+                       "embeds": [embed], "allowed_mentions": allowed}
+            discord_post(payload)
+        sent += 1
+
+    print(f"Sent {sent} signal(s) to Discord.")
 
 
 if __name__ == "__main__":
     main()
+
