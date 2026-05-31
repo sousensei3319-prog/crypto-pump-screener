@@ -221,7 +221,15 @@ def ema(values, period):
     return e
 
 
+def swing_low_1h(c1h):
+    """直近6時間の1h足最安値 = 早期エントリートリガー（速いシグナル）"""
+    if len(c1h) < 7:
+        return None
+    return min(b["l"] for b in c1h[-7:-1])
+
+
 def trend_state_4h(c4h):
+    """4h EMA20と直近24時間の最安値（下落トレンド転換確認用）"""
     if len(c4h) < 25:
         return None
     closes = [b["c"] for b in c4h]
@@ -233,7 +241,7 @@ def trend_state_4h(c4h):
     if above_ema:
         state = "4h EMA20の上(まだ上昇中) → ブレイクダウン待ち"
     elif price < swing_low:
-        state = "4h EMA20下+直近安値割れ → 下落トレンド(エントリー圏)"
+        state = "4h EMA20下+直近安値割れ → 下落トレンド確定"
     else:
         state = "4h EMA20の下(失速中) → 直近安値を監視"
     return {"ema20": e20, "swing_low": swing_low, "above_ema": above_ema, "state": state}
@@ -375,12 +383,16 @@ def render_chart_png(coin, c1h, c4h, plan_levels):
             axv.bar(i, b["v"], width=widths, color=color, alpha=0.7)
 
         # Plan lines
-        sl, tp1, tp2, trig = plan_levels.get("sl"), plan_levels.get("tp1"), \
-                              plan_levels.get("tp2"), plan_levels.get("trigger")
-        if sl:   ax.axhline(sl,   color="#ff5252", linestyle="--", linewidth=0.9, label=f"SL {sl:.6g}")
-        if trig: ax.axhline(trig, color="#ffb74d", linestyle="--", linewidth=0.9, label=f"Trig {trig:.6g}")
-        if tp1:  ax.axhline(tp1,  color="#66bb6a", linestyle="--", linewidth=0.9, label=f"TP1 {tp1:.6g}")
-        if tp2:  ax.axhline(tp2,  color="#1e88e5", linestyle="--", linewidth=0.9, label=f"TP2 {tp2:.6g}")
+        sl = plan_levels.get("sl")
+        tp1 = plan_levels.get("tp1")
+        tp2 = plan_levels.get("tp2")
+        early = plan_levels.get("early_entry")
+        brk = plan_levels.get("trend_break")
+        if sl:    ax.axhline(sl,    color="#ff5252", linestyle="--", linewidth=0.9, label=f"SL {sl:.6g}")
+        if early: ax.axhline(early, color="#ffeb3b", linestyle="--", linewidth=0.9, label=f"1h早期 {early:.6g}")
+        if tp1:   ax.axhline(tp1,   color="#66bb6a", linestyle="--", linewidth=0.9, label=f"TP1半値 {tp1:.6g}")
+        if brk:   ax.axhline(brk,   color="#ff9800", linestyle="--", linewidth=0.9, label=f"4hブレイク {brk:.6g}")
+        if tp2:   ax.axhline(tp2,   color="#1e88e5", linestyle="--", linewidth=0.9, label=f"TP2全戻し {tp2:.6g}")
 
         ax.set_title(f"{coin} - 1h (last 72h)  |  OKX", color="#eeeeee", fontsize=11)
         ax.legend(fontsize=7, loc="upper left")
@@ -499,21 +511,19 @@ def build_embed(cand):
     half_tp = peak - 0.5 * (peak - baseline)
     full_tp = baseline
     sl = peak * 1.02
-    trigger = tr["swing_low"] if tr else None
+    early_entry = cand.get("swing_low_1h")           # 1h 早期エントリー
+    trend_break = tr["swing_low"] if tr else None    # 4h 追加ショート/確認
 
-    if tr and tr["above_ema"]:
-        plan = (f"4時間足: {tr['state']}\n"
-                f"エントリートリガー: 4h終値が {fmt_price(tr['swing_low'])} を下抜け\n"
-                f"損切 > {fmt_price(sl)} (当日高値) | 利確1 {fmt_price(half_tp)} (半値) ・ "
-                f"利確2 {fmt_price(full_tp)} (全戻し)")
-    elif tr:
-        plan = (f"4時間足: {tr['state']}\n"
-                f"戻りを売る。損切 > {fmt_price(sl)} | "
-                f"利確1 {fmt_price(half_tp)} (半値) ・ 利確2 {fmt_price(full_tp)} (全戻し)")
-    else:
-        plan = (f"損切 > {fmt_price(sl)} | 利確1 {fmt_price(half_tp)} (半値) ・ "
-                f"利確2 {fmt_price(full_tp)} (全戻し)")
-    fields.append({"name": "トレンド / エントリープラン", "value": plan, "inline": False})
+    lines = []
+    if tr:
+        lines.append(f"4時間足: {tr['state']}")
+    if early_entry:
+        lines.append(f"🟡 早期エントリー: 1h終値が {fmt_price(early_entry)} を下抜け")
+    if trend_break:
+        lines.append(f"🟠 追加ショート: 4h終値が {fmt_price(trend_break)} を下抜け(下落トレンド確認)")
+    lines.append(f"🔴 損切 > {fmt_price(sl)} (当日高値+2%)")
+    lines.append(f"🟢 利確1 {fmt_price(half_tp)} (半値戻し) ・ 🔵 利確2 {fmt_price(full_tp)} (全戻し)")
+    fields.append({"name": "トレンド / エントリープラン", "value": "\n".join(lines), "inline": False})
 
     fields.append({
         "name": "リンク",
@@ -526,7 +536,8 @@ def build_embed(cand):
     embed = {"title": title, "color": color, "fields": fields,
              "footer": {"text": f"暴騰ダンプ・スクリーナー v3 | {now_jst}"}}
 
-    plan_levels = {"sl": sl, "tp1": half_tp, "tp2": full_tp, "trigger": trigger}
+    plan_levels = {"sl": sl, "tp1": half_tp, "tp2": full_tp,
+                   "early_entry": early_entry, "trend_break": trend_break}
     return embed, plan_levels
 
 
@@ -610,12 +621,14 @@ def main():
         day_high = daily[-1]["h"] if daily else max(p["price"], p["open24"])
         pump_ref = (day_high - baseline) / baseline * 100 if baseline else p["chg_24h"]
 
+        sw1h = swing_low_1h(c1h) if c1h else None
+
         candidates.append({
             "inst_id": inst, "coin": coin, "price": p["price"],
             "chg_1h": chg_1h, "chg_24h": p["chg_24h"], "vol_24h": p["vol_24h"],
             "funding": funding, "next_funding": nft, "oi_chg": oi_chg,
             "ls_ratio": ls, "cvd": cvd, "vlt": vlt, "btc_cor": btc_cor,
-            "cats": cats, "hist": hist, "trend": trend,
+            "cats": cats, "hist": hist, "trend": trend, "swing_low_1h": sw1h,
             "score": score, "reasons": reasons,
             "baseline": baseline, "day_high": day_high, "pump_ref": pump_ref,
             "_c1h": c1h, "_c4h": c4h,
