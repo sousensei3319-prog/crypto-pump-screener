@@ -39,9 +39,9 @@ MENTION_EVERYONE = os.environ.get("MENTION_EVERYONE", "1") == "1"
 
 OKX = "https://www.okx.com/api/v5"
 
-# ---- Detection thresholds (PRODUCTION) ----
-PUMP_1H = 10.0
-PUMP_24H = 20.0
+# ---- Detection thresholds (TEST - LOWERED) ----
+PUMP_1H = 3.0
+PUMP_24H = 8.0
 MIN_VOLUME_24H = 2_000_000
 EXCLUDE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
 
@@ -543,14 +543,25 @@ def build_embed(cand):
     vlt_str = f"{cand['vlt']:.2f}%" if cand["vlt"] is not None else "n/a"
     cor_str = f"{cand['btc_cor']:+.2f}" if cand["btc_cor"] is not None else "n/a"
 
+    # カテゴリは ANSIコードブロックで赤太字に（Discordの裏技）
+    if cand["cats"]:
+        cat_line = f"```ansi\n[1;31mカテゴリ {cat_str}[0m\n```"
+    else:
+        cat_line = "カテゴリ -"
+
     fields = [
         {"name": "値動き",
          "value": f"{fmt_price(price)} | 1時間 {cand['chg_1h']:+.1f}% | 24時間 {cand['chg_24h']:+.1f}%",
          "inline": False},
         {"name": "シグナル根拠",
          "value": (f"FR {fr_str}\n"
-                   f"OI変化 {oi_str} | L/S比 {ls_str} | 1h売買差 {cvd_str}\n"
-                   f"24h出来高 {fmt_money(cand['vol_24h'])} | ボラ {vlt_str} | BTC相関 {cor_str} | カテゴリ {cat_str}"),
+                   f"OI変化 {oi_str}\n"
+                   f"L/S比 {ls_str}\n"
+                   f"1h売買差 {cvd_str}\n"
+                   f"24h出来高 {fmt_money(cand['vol_24h'])}\n"
+                   f"ボラ {vlt_str}\n"
+                   f"BTC相関 {cor_str}\n"
+                   f"{cat_line}"),
          "inline": False},
     ]
 
