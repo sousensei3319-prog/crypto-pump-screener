@@ -26,6 +26,10 @@ try:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
+    try:
+        import japanize_matplotlib  # noqa: F401  日本語フォント自動設定
+    except Exception:
+        pass
     HAS_MPL = True
 except Exception:
     HAS_MPL = False
@@ -35,9 +39,9 @@ MENTION_EVERYONE = os.environ.get("MENTION_EVERYONE", "1") == "1"
 
 OKX = "https://www.okx.com/api/v5"
 
-# ---- Detection thresholds (PRODUCTION) ----
-PUMP_1H = 10.0
-PUMP_24H = 20.0
+# ---- Detection thresholds (TEST - LOWERED) ----
+PUMP_1H = 3.0
+PUMP_24H = 8.0
 MIN_VOLUME_24H = 2_000_000
 EXCLUDE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
 
@@ -221,6 +225,20 @@ def ema(values, period):
     return e
 
 
+def ema_series(values, period):
+    """各時点のEMAを時系列で返す（チャート描画用）。"""
+    if len(values) < period:
+        return [None] * len(values)
+    result = [None] * len(values)
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period
+    result[period - 1] = e
+    for i in range(period, len(values)):
+        e = values[i] * k + e * (1 - k)
+        result[i] = e
+    return result
+
+
 def swing_low_1h(c1h):
     """直近6時間の1h足最安値 = 早期エントリートリガー（速いシグナル）"""
     if len(c1h) < 7:
@@ -367,20 +385,31 @@ def render_chart_png(coin, c1h, c4h, plan_levels):
         fig, axes = plt.subplots(2, 1, figsize=(8, 6), dpi=110,
                                  gridspec_kw={"height_ratios": [3, 1]})
         ax, axv = axes
-        bars = c1h[-72:]  # last 72h
-        xs = list(range(len(bars)))
+        # 直近72hだけ表示するが、EMA80計算用に手前の本数も使う
+        all_bars = c1h
+        n_show = 72
+        bars = all_bars[-n_show:]
+        # EMA80 を全データで計算し、表示部分だけ抽出
+        closes_all = [b["c"] for b in all_bars]
+        ema80_all = ema_series(closes_all, 80)
+        ema80_show = ema80_all[-n_show:]
         widths = 0.7
         for i, b in enumerate(bars):
             up = b["c"] >= b["o"]
             color = "#26a69a" if up else "#ef5350"
-            # wick
             ax.plot([i, i], [b["l"], b["h"]], color=color, linewidth=0.7)
-            # body
             top = max(b["o"], b["c"]); bot = min(b["o"], b["c"])
             height = max(top - bot, (bars[-1]["c"] * 0.0005))
             ax.add_patch(Rectangle((i - widths / 2, bot), widths, height,
                                    facecolor=color, edgecolor=color))
             axv.bar(i, b["v"], width=widths, color=color, alpha=0.7)
+
+        # EMA80 線（4h EMA20相当）
+        xs_ema = [i for i, v in enumerate(ema80_show) if v is not None]
+        ys_ema = [v for v in ema80_show if v is not None]
+        if xs_ema:
+            ax.plot(xs_ema, ys_ema, color="#bb86fc", linewidth=1.2,
+                    label=f"EMA80(4h EMA20相当) {ys_ema[-1]:.6g}")
 
         # Plan lines
         sl = plan_levels.get("sl")
@@ -388,11 +417,13 @@ def render_chart_png(coin, c1h, c4h, plan_levels):
         tp2 = plan_levels.get("tp2")
         early = plan_levels.get("early_entry")
         brk = plan_levels.get("trend_break")
+        sup7d = plan_levels.get("support_7d")
         if sl:    ax.axhline(sl,    color="#ff5252", linestyle="--", linewidth=0.9, label=f"SL {sl:.6g}")
         if early: ax.axhline(early, color="#ffeb3b", linestyle="--", linewidth=0.9, label=f"1h早期 {early:.6g}")
         if tp1:   ax.axhline(tp1,   color="#66bb6a", linestyle="--", linewidth=0.9, label=f"TP1半値 {tp1:.6g}")
         if brk:   ax.axhline(brk,   color="#ff9800", linestyle="--", linewidth=0.9, label=f"4hブレイク {brk:.6g}")
         if tp2:   ax.axhline(tp2,   color="#1e88e5", linestyle="--", linewidth=0.9, label=f"TP2全戻し {tp2:.6g}")
+        if sup7d: ax.axhline(sup7d, color="#9e9e9e", linestyle=":",  linewidth=1.0, label=f"7日サポート {sup7d:.6g}")
 
         ax.set_title(f"{coin} - 1h (last 72h)  |  OKX", color="#eeeeee", fontsize=11)
         ax.legend(fontsize=7, loc="upper left")
@@ -522,8 +553,18 @@ def build_embed(cand):
     if trend_break:
         lines.append(f"🟠 追加ショート: 4h終値が {fmt_price(trend_break)} を下抜け(下落トレンド確認)")
     lines.append(f"🔴 損切 > {fmt_price(sl)} (当日高値+2%)")
-    lines.append(f"🟢 利確1 {fmt_price(half_tp)} (半値戻し) ・ 🔵 利確2 {fmt_price(full_tp)} (全戻し)")
+    lines.append(f"🟢 利確1 {fmt_price(half_tp)} (半値戻し)")
+    lines.append(f"🔵 利確2 {fmt_price(full_tp)} (全戻し)")
+    sup7d = cand.get("support_7d")
+    if sup7d:
+        lines.append(f"⚪ 7日サポート {fmt_price(sup7d)} (さらに下の目標)")
     fields.append({"name": "トレンド / エントリープラン", "value": "\n".join(lines), "inline": False})
+
+    note = ("※線の距離と意味\n"
+            "🟡(1h早期)≈🟢(TP1): 急騰が緩やか時に近接/逆転。TP1付近で反転する可能性あり\n"
+            "🟠(4hブレイク)<🔵(TP2): 24h内に大きく下げた銘柄で発生。全戻し後さらに下げる余地あり\n"
+            "⚪(7日サポート): 直近1週間の最安値。TP2の先の中期目標")
+    fields.append({"name": "補足", "value": note, "inline": False})
 
     fields.append({
         "name": "リンク",
@@ -537,7 +578,8 @@ def build_embed(cand):
              "footer": {"text": f"暴騰ダンプ・スクリーナー v3 | {now_jst}"}}
 
     plan_levels = {"sl": sl, "tp1": half_tp, "tp2": full_tp,
-                   "early_entry": early_entry, "trend_break": trend_break}
+                   "early_entry": early_entry, "trend_break": trend_break,
+                   "support_7d": cand.get("support_7d")}
     return embed, plan_levels
 
 
@@ -582,7 +624,8 @@ def main():
     for p in prelim:
         inst = p["inst_id"]; coin = p["coin"]
         try:
-            c1h = get_candles(inst, "1H", 72)
+            # 7日(168h) + EMA80計算余裕 → 168本取得
+            c1h = get_candles(inst, "1H", 168)
             chg_1h = 0.0
             if len(c1h) >= 2 and c1h[-2]["o"] > 0:
                 chg_1h = (c1h[-1]["c"] - c1h[-2]["o"]) / c1h[-2]["o"] * 100
@@ -622,6 +665,8 @@ def main():
         pump_ref = (day_high - baseline) / baseline * 100 if baseline else p["chg_24h"]
 
         sw1h = swing_low_1h(c1h) if c1h else None
+        # 直近7日(168h)の最安値 = 中期サポート
+        support_7d = min(b["l"] for b in c1h[-168:]) if len(c1h) >= 24 else None
 
         candidates.append({
             "inst_id": inst, "coin": coin, "price": p["price"],
@@ -629,6 +674,7 @@ def main():
             "funding": funding, "next_funding": nft, "oi_chg": oi_chg,
             "ls_ratio": ls, "cvd": cvd, "vlt": vlt, "btc_cor": btc_cor,
             "cats": cats, "hist": hist, "trend": trend, "swing_low_1h": sw1h,
+            "support_7d": support_7d,
             "score": score, "reasons": reasons,
             "baseline": baseline, "day_high": day_high, "pump_ref": pump_ref,
             "_c1h": c1h, "_c4h": c4h,
