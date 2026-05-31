@@ -39,9 +39,9 @@ MENTION_EVERYONE = os.environ.get("MENTION_EVERYONE", "1") == "1"
 
 OKX = "https://www.okx.com/api/v5"
 
-# ---- Detection thresholds (TEST - LOWERED) ----
-PUMP_1H = 3.0
-PUMP_24H = 8.0
+# ---- Detection thresholds (PRODUCTION) ----
+PUMP_1H = 10.0
+PUMP_24H = 20.0
 MIN_VOLUME_24H = 2_000_000
 EXCLUDE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
 
