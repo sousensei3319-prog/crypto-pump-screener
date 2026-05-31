@@ -186,20 +186,20 @@ def analyze_history(daily):
     typ_hi = sizes[(len(sizes) * 3) // 4]
 
     if N >= 15 and dump_rate >= 0.80:
-        tier, tier_score = "VERY HIGH", 4
+        tier, tier_score = "極高", 4
     elif N >= 8 and dump_rate >= 0.70:
-        tier, tier_score = "HIGH", 3
+        tier, tier_score = "高", 3
     elif N >= 4 and dump_rate >= 0.60:
-        tier, tier_score = "MODERATE", 2
+        tier, tier_score = "中", 2
     else:
-        tier, tier_score = "LOW", 0
+        tier, tier_score = "低", 0
 
     if avg_retrace >= 0.85:
-        tp_tendency = "near-FULL retrace"
+        tp_tendency = "ほぼ全戻し傾向"
     elif avg_retrace >= 0.5:
-        tp_tendency = "HALF-to-full retrace"
+        tp_tendency = "半値〜全戻し傾向"
     else:
-        tp_tendency = "shallow"
+        tp_tendency = "浅めの戻し"
 
     return {"N": N, "dump_count": len(dumped), "dump_rate": dump_rate,
             "avg_retrace": avg_retrace, "avg_days": avg_days,
@@ -231,11 +231,11 @@ def trend_state_4h(c4h):
     swing_low = min(b["l"] for b in recent) if recent else c4h[-1]["l"]
     above_ema = price > e20
     if above_ema:
-        state = "ABOVE 4h EMA20 (still pumping) -> WAIT for breakdown"
+        state = "4h EMA20の上(まだ上昇中) → ブレイクダウン待ち"
     elif price < swing_low:
-        state = "BELOW 4h EMA20 + swing low broken -> DOWNTREND (entry zone)"
+        state = "4h EMA20下+直近安値割れ → 下落トレンド(エントリー圏)"
     else:
-        state = "BELOW 4h EMA20 (rolling over) -> watch swing low"
+        state = "4h EMA20の下(失速中) → 直近安値を監視"
     return {"ema20": e20, "swing_low": swing_low, "above_ema": above_ema, "state": state}
 
 
@@ -317,31 +317,31 @@ def score_candidate(hist, funding, oi_chg, ls_ratio, cvd, vlt, cats):
     if hist:
         score += hist["tier_score"]
         if hist["tier_score"] > 0:
-            reasons.append(f"repro {hist['tier']}(+{hist['tier_score']})")
+            reasons.append(f"再現性{hist['tier']}(+{hist['tier_score']})")
 
     fr_pct = funding * 100
     if fr_pct > 0.1:
-        score += 2; reasons.append("FR very high(+2)")
+        score += 2; reasons.append("FR非常に高い(+2)")
     elif fr_pct > 0.05:
-        score += 1; reasons.append("FR elevated(+1)")
+        score += 1; reasons.append("FR高め(+1)")
 
     if oi_chg is not None:
         if oi_chg > 10:
-            score += 2; reasons.append("OI surge(+2)")
+            score += 2; reasons.append("OI急増(+2)")
         elif oi_chg > 5:
-            score += 1; reasons.append("OI rising(+1)")
+            score += 1; reasons.append("OI上昇中(+1)")
 
     if ls_ratio is not None:
         if ls_ratio > 2.0:
-            score += 2; reasons.append("retail very long(+2)")
+            score += 2; reasons.append("個人ロング過熱(+2)")
         elif ls_ratio > 1.5:
-            score += 1; reasons.append("retail long-heavy(+1)")
+            score += 1; reasons.append("個人ロング偏重(+1)")
 
     if cvd is not None and cvd < 0:
-        score += 1; reasons.append("CVD selling(+1)")
+        score += 1; reasons.append("売り優勢CVD(+1)")
 
     if vlt is not None and vlt > 3.0:
-        score += 1; reasons.append("high vol(+1)")
+        score += 1; reasons.append("高ボラ(+1)")
 
     if cats:
         score += 1; reasons.append(f"{'/'.join(cats)}(+1)")
@@ -449,12 +449,12 @@ def build_embed(cand):
     price = cand["price"]; score = cand["score"]
     hist = cand["hist"]; tr = cand["trend"]
 
-    if score >= 7:   color, tier_icon = 0xFF0000, "STRONG"
-    elif score >= 4: color, tier_icon = 0xFFAA00, "WATCH"
-    else:            color, tier_icon = 0x888888, "WEAK"
+    if score >= 7:   color, tier_icon = 0xFF0000, "🔴 強推奨"
+    elif score >= 4: color, tier_icon = 0xFFAA00, "🟡 監視"
+    else:            color, tier_icon = 0x888888, "⚪ 弱"
 
     repro = hist["tier"] if hist else "N/A"
-    title = f"{tier_icon}: {coin}USDT  [Score {score}/10 | Repro {repro}]"
+    title = f"{tier_icon}: {coin}USDT  [スコア {score}/10 | 再現性 {repro}]"
 
     now_jst = datetime.now(JST).strftime("%m-%d %H:%M JST")
     cat_str = "/".join(cand["cats"]) if cand["cats"] else "-"
@@ -463,7 +463,7 @@ def build_embed(cand):
     nft_min = minutes_until(cand["next_funding"])
     fr_str = f"{fr_pct:+.4f}%"
     if nft_min is not None:
-        fr_str += f" (next {nft_min}m)"
+        fr_str += f" (次回 {nft_min}分後)"
     oi_str = f"{cand['oi_chg']:+.1f}%/1h" if cand["oi_chg"] is not None else "n/a"
     ls_str = f"{cand['ls_ratio']:.2f}" if cand["ls_ratio"] is not None else "n/a"
     cvd_str = fmt_money(cand["cvd"]) if cand["cvd"] is not None else "n/a"
@@ -471,28 +471,28 @@ def build_embed(cand):
     cor_str = f"{cand['btc_cor']:+.2f}" if cand["btc_cor"] is not None else "n/a"
 
     fields = [
-        {"name": "Move",
-         "value": f"{fmt_price(price)} | 1h {cand['chg_1h']:+.1f}% | 24h {cand['chg_24h']:+.1f}%",
+        {"name": "値動き",
+         "value": f"{fmt_price(price)} | 1時間 {cand['chg_1h']:+.1f}% | 24時間 {cand['chg_24h']:+.1f}%",
          "inline": False},
-        {"name": "Confluence",
+        {"name": "シグナル根拠",
          "value": (f"FR {fr_str}\n"
-                   f"OI {oi_str} | L/S {ls_str} | CVD1h {cvd_str}\n"
-                   f"Vol24h {fmt_money(cand['vol_24h'])} | VLT {vlt_str} | BTC-cor {cor_str} | Cat {cat_str}"),
+                   f"OI変化 {oi_str} | L/S比 {ls_str} | 1h売買差 {cvd_str}\n"
+                   f"24h出来高 {fmt_money(cand['vol_24h'])} | ボラ {vlt_str} | BTC相関 {cor_str} | カテゴリ {cat_str}"),
          "inline": False},
     ]
 
     if hist:
         hist_val = (
-            f"{hist['N']} past pumps >={int(PUMP_EVENT_PCT)}% -> {hist['dump_count']} dumped "
+            f"過去{int(PUMP_EVENT_PCT)}%超の急騰 {hist['N']}回 → {hist['dump_count']}回ダンプ "
             f"({hist['dump_rate']*100:.0f}%)\n"
-            f"Avg retrace {hist['avg_retrace']*100:.0f}% of pump over ~{hist['avg_days']:.1f}d "
-            f"-> {hist['tp_tendency']}\n"
-            f"Typical past pump: +{hist['typ_lo']:.0f}~{hist['typ_hi']:.0f}% "
-            f"(now +{cand['pump_ref']:.0f}%)"
+            f"平均戻し幅 {hist['avg_retrace']*100:.0f}% / 約{hist['avg_days']:.1f}日 "
+            f"→ {hist['tp_tendency']}\n"
+            f"過去の典型的な急騰幅: +{hist['typ_lo']:.0f}〜{hist['typ_hi']:.0f}% "
+            f"(今回 +{cand['pump_ref']:.0f}%)"
         )
     else:
-        hist_val = "Insufficient history (new listing?) - lower confidence"
-    fields.append({"name": f"Historical Pattern ({hist['hist_days'] if hist else 0}d)",
+        hist_val = "履歴不足（新規上場?）- 信頼度低め"
+    fields.append({"name": f"過去パターン ({hist['hist_days'] if hist else 0}日)",
                    "value": hist_val, "inline": False})
 
     baseline = cand["baseline"]; peak = cand["day_high"]
@@ -502,29 +502,29 @@ def build_embed(cand):
     trigger = tr["swing_low"] if tr else None
 
     if tr and tr["above_ema"]:
-        plan = (f"4h: {tr['state']}\n"
-                f"Entry trigger: 4h close below {fmt_price(tr['swing_low'])}\n"
-                f"SL > {fmt_price(sl)} (day high) | TP1 {fmt_price(half_tp)} (half) · "
-                f"TP2 {fmt_price(full_tp)} (full)")
+        plan = (f"4時間足: {tr['state']}\n"
+                f"エントリートリガー: 4h終値が {fmt_price(tr['swing_low'])} を下抜け\n"
+                f"損切 > {fmt_price(sl)} (当日高値) | 利確1 {fmt_price(half_tp)} (半値) ・ "
+                f"利確2 {fmt_price(full_tp)} (全戻し)")
     elif tr:
-        plan = (f"4h: {tr['state']}\n"
-                f"Short on bounce. SL > {fmt_price(sl)} | "
-                f"TP1 {fmt_price(half_tp)} (half) · TP2 {fmt_price(full_tp)} (full)")
+        plan = (f"4時間足: {tr['state']}\n"
+                f"戻りを売る。損切 > {fmt_price(sl)} | "
+                f"利確1 {fmt_price(half_tp)} (半値) ・ 利確2 {fmt_price(full_tp)} (全戻し)")
     else:
-        plan = (f"SL > {fmt_price(sl)} | TP1 {fmt_price(half_tp)} (half) · "
-                f"TP2 {fmt_price(full_tp)} (full)")
-    fields.append({"name": "Trend / Entry Plan", "value": plan, "inline": False})
+        plan = (f"損切 > {fmt_price(sl)} | 利確1 {fmt_price(half_tp)} (半値) ・ "
+                f"利確2 {fmt_price(full_tp)} (全戻し)")
+    fields.append({"name": "トレンド / エントリープラン", "value": plan, "inline": False})
 
     fields.append({
-        "name": "Links",
-        "value": (f"[CoinGlass](https://www.coinglass.com/ja/currencies/{coin}) · "
-                  f"[Orion](https://screener.orionterminal.com/) · "
+        "name": "リンク",
+        "value": (f"[CoinGlass](https://www.coinglass.com/ja/currencies/{coin}) ・ "
+                  f"[Orion](https://screener.orionterminal.com/) ・ "
                   f"[OKX](https://www.okx.com/trade-swap/{inst.lower()})"),
         "inline": False,
     })
 
     embed = {"title": title, "color": color, "fields": fields,
-             "footer": {"text": f"Pump-Dump Screener v3 | {now_jst}"}}
+             "footer": {"text": f"暴騰ダンプ・スクリーナー v3 | {now_jst}"}}
 
     plan_levels = {"sl": sl, "tp1": half_tp, "tp2": full_tp, "trigger": trigger}
     return embed, plan_levels
