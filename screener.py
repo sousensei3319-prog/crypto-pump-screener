@@ -39,9 +39,9 @@ MENTION_EVERYONE = os.environ.get("MENTION_EVERYONE", "1") == "1"
 
 OKX = "https://www.okx.com/api/v5"
 
-# ---- Detection thresholds (PRODUCTION) ----
-PUMP_1H = 10.0
-PUMP_24H = 20.0
+# ---- Detection thresholds (TEST - LOWERED) ----
+PUMP_1H = 3.0
+PUMP_24H = 8.0
 MIN_VOLUME_24H = 2_000_000
 EXCLUDE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
 
@@ -51,7 +51,8 @@ PUMP_EVENT_PCT = 15.0
 FORWARD_WINDOW = 3
 DUMP_RETRACE_MIN = 0.5
 
-# ---- Category lists ----
+# ---- Category seeds (fallback if CoinGecko fails) ----
+# 起動時に CoinGecko の最新カテゴリと自動マージされる
 MEME = {"DOGE","SHIB","PEPE","WIF","BONK","FLOKI","MEME","BOME","MEW","POPCAT","NEIRO",
         "TURBO","BRETT","MOG","PNUT","GOAT","ACT","HIPPO","DOGS","CAT","BABYDOGE","SPX",
         "GIGGLE","FARTCOIN","CHILLGUY","MOODENG","PONKE","RETARDIO","SLERF","MYRO"}
@@ -59,6 +60,35 @@ GAMEFI = {"GALA","AXS","SAND","MANA","IMX","PIXEL","BIGTIME","GMT","MAGIC","PYR"
           "APE","GODS","NAKA","XAI","ACE","PORTAL","ZBCN"}
 AI = {"FET","AGIX","RNDR","RENDER","TAO","WLD","AI","ARKM","NMR","OCEAN","GRT","PHA",
       "AIOZ","NFP","VIRTUAL","AIXBT","ZEREBRO","GRIFFAIN","AI16Z","ARC","SWARMS"}
+
+COINGECKO_CATEGORIES = [
+    ("MEME",   "meme-token"),
+    ("GAMEFI", "gaming"),
+    ("AI",     "artificial-intelligence"),
+]
+
+
+def update_categories_from_coingecko():
+    """CoinGecko公開APIで最新のカテゴリ別シンボル集合を取得し、グローバルにマージ。
+    失敗してもfallbackリストで動くので安全。"""
+    global MEME, GAMEFI, AI
+    cg_base = "https://api.coingecko.com/api/v3/coins/markets"
+    for label, cat_id in COINGECKO_CATEGORIES:
+        try:
+            url = f"{cg_base}?vs_currency=usd&category={cat_id}&per_page=250&page=1"
+            data = fetch_json(url)
+            if not isinstance(data, list):
+                print(f"  CoinGecko {label}: unexpected response, skipped")
+                continue
+            syms = {str(it["symbol"]).upper() for it in data if it.get("symbol")}
+            before = len(globals()[label])
+            if label == "MEME":   MEME = MEME | syms
+            elif label == "GAMEFI": GAMEFI = GAMEFI | syms
+            else:                   AI = AI | syms
+            after = len(globals()[label])
+            print(f"  CoinGecko {label}: {len(syms)} fetched -> set {before}->{after}")
+        except Exception as e:
+            print(f"  CoinGecko {label} failed ({e}), using fallback")
 
 JST = timezone(timedelta(hours=9))
 
@@ -588,6 +618,8 @@ def build_embed(cand):
 # ============================================================
 def main():
     print(f"Scan v3 start {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}")
+    # Refresh category symbol sets from CoinGecko (auto-tag new coins)
+    update_categories_from_coingecko()
     tickers = get_all_tickers()
     print(f"Fetched {len(tickers)} USDT-SWAP tickers (matplotlib={HAS_MPL})")
 
